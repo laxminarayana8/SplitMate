@@ -1,0 +1,3 @@
+AMOUNT = 1
+CATEGORY = 2
+SPLIT = 3
