@@ -1,0 +1,15 @@
+anthropic==0.69.0
+anyio==4.14.2
+certifi==2026.7.22
+et_xmlfile==2.0.0
+fastapi==0.116.1
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.18
+openpyxl==3.1.5
+Pillow==11.1.0
+python-dotenv==1.2.2
+python-telegram-bot==22.8
+typing_extensions==4.16.0
+uvicorn==0.35.0
