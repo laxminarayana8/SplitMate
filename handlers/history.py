@@ -117,7 +117,7 @@ async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         FROM expenses e
         JOIN members m
             ON e.payer_member_id = m.member_id
-        WHERE e.group_id = ? AND e.category != 'Settlement'
+        WHERE e.group_id = ? AND e.category != 'Settlement' AND e.status != 'declined'
     """
     params = [group_id]
     filter_title = ""

@@ -42,6 +42,7 @@ from handlers.expense import (
     duplicate_confirmation_callback,
     equal_among_toggle_callback,
     equal_among_continue_callback,
+    share_decline_callback,
 )
 from handlers.history import history, history_callback
 from handlers.balance import balance
@@ -366,6 +367,14 @@ def main():
     # -------------------------
     app.add_handler(
         CallbackQueryHandler(expense_action_callback, pattern="^exp_(conf|edit|del):")
+    )
+
+    # Standalone: participants tapping "❌ Decline" on their private "your
+    # share" DM. Deliberately NOT part of the expense ConversationHandler --
+    # it fires in a *different* user's private chat, potentially long after
+    # the original conversation ended.
+    app.add_handler(
+        CallbackQueryHandler(share_decline_callback, pattern="^share_decline:")
     )
 
     app.add_handler(CallbackQueryHandler(settle_approval_callback, pattern="^(settle_|approve_|decline_)"))

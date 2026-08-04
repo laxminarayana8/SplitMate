@@ -74,6 +74,7 @@ def create_tables():
         category TEXT NOT NULL,
         description TEXT,
         split_type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
         FOREIGN KEY(group_id)
@@ -85,6 +86,14 @@ def create_tables():
             ON DELETE RESTRICT
     )
     """)
+
+    # Migration: expenses created before the decline-window feature don't
+    # have a status column yet. Backfill them as 'active' so pre-existing
+    # history/balances are unaffected.
+    cursor.execute("PRAGMA table_info(expenses)")
+    existing_expense_cols = {row[1] for row in cursor.fetchall()}
+    if "status" not in existing_expense_cols:
+        cursor.execute("ALTER TABLE expenses ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
 
     # -----------------------------
     # EXPENSE SHARES
@@ -235,6 +244,32 @@ def create_tables():
         PRIMARY KEY (user_id, group_id),
         FOREIGN KEY(group_id)
             REFERENCES groups(group_id)
+            ON DELETE CASCADE
+    )
+    """)
+
+    # -----------------------------
+    # EXPENSE SHARE NOTIFICATIONS (NEW)
+    # -----------------------------
+    # Tracks the private "your share is ₹X — Decline?" DM sent to each
+    # participant of an expense, so that when one person declines we can go
+    # back and edit every other participant's copy of that DM (and the
+    # original card) to show it's no longer actionable.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS expense_notifications (
+        expense_id INTEGER NOT NULL,
+        member_id INTEGER NOT NULL,
+        telegram_user_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+
+        PRIMARY KEY (expense_id, member_id),
+
+        FOREIGN KEY(expense_id)
+            REFERENCES expenses(expense_id)
+            ON DELETE CASCADE,
+
+        FOREIGN KEY(member_id)
+            REFERENCES members(member_id)
             ON DELETE CASCADE
     )
     """)
@@ -436,12 +471,59 @@ def reset_user_subgroup(group_id: int, user_id: int):
 _EXPENSE_FILTER_SQL = """
     AND (category IS NULL OR LOWER(category) NOT IN ('settlement', 'settle'))
     AND (split_type IS NULL OR LOWER(split_type) != 'personal')
+    AND (status IS NULL OR status != 'declined')
 """
 
 _EXPENSE_FILTER_SQL_ALIASED = """
     AND (e.category IS NULL OR LOWER(e.category) NOT IN ('settlement', 'settle'))
     AND (e.split_type IS NULL OR LOWER(e.split_type) != 'personal')
+    AND (e.status IS NULL OR e.status != 'declined')
 """
+
+
+# -----------------------------
+# EXPENSE DECLINE WINDOW
+# -----------------------------
+# How long a linked participant has to decline their share of an expense
+# after it's added, before it's locked in for good. Kept here (rather than
+# only in handlers/expense.py) so any future job/cron that wants to expire
+# stale decline buttons can import the same constant.
+EXPENSE_DECLINE_WINDOW_HOURS = 12
+
+
+def expense_decline_deadline_passed(created_at: str) -> bool:
+    """True if more than EXPENSE_DECLINE_WINDOW_HOURS have elapsed since
+    `created_at` (an IST 'YYYY-MM-DD HH:MM:SS' string, as written by
+    now_ist()). No scheduler needed -- this is checked on-demand whenever
+    someone taps Decline."""
+    created_dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+    now_naive = datetime.now(IST).replace(tzinfo=None)
+    return now_naive > created_dt + timedelta(hours=EXPENSE_DECLINE_WINDOW_HOURS)
+
+
+def record_expense_notification(expense_id: int, member_id: int, telegram_user_id: int, message_id: int):
+    """Remembers where a participant's 'your share' DM was sent, so it can
+    be edited later (e.g. once someone else declines)."""
+    execute(
+        """
+        INSERT INTO expense_notifications (expense_id, member_id, telegram_user_id, message_id)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(expense_id, member_id) DO UPDATE SET
+            telegram_user_id=excluded.telegram_user_id,
+            message_id=excluded.message_id
+        """,
+        (expense_id, member_id, telegram_user_id, message_id),
+    )
+
+
+def get_expense_notifications(expense_id: int):
+    """Returns [(member_id, telegram_user_id, message_id), ...] for every
+    participant DM sent for this expense."""
+    return execute(
+        "SELECT member_id, telegram_user_id, message_id FROM expense_notifications WHERE expense_id=?",
+        (expense_id,),
+        fetch=True,
+    ) or []
 
 
 def _month_total_expenditure(group_id: int, year: int, month: int) -> float:

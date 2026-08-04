@@ -50,7 +50,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         SELECT SUM(amount) 
         FROM expenses 
-        WHERE group_id = ? AND payer_member_id = ?
+        WHERE group_id = ? AND payer_member_id = ? AND status != 'declined'
         """,
         (group_id, current_member_id),
         fetch=True

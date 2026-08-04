@@ -35,6 +35,7 @@ async def bot_added_to_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #    each, ever, per group) and post an invite card with a Join Group button.
 # -----------------------------
 async def new_chat_members_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("========== NEW MEMBER HANDLER ==========")
     message = update.message
     chat = update.effective_chat
 
@@ -276,7 +277,7 @@ async def _refresh_or_finalize_pending_expense(context: ContextTypes.DEFAULT_TYP
 
     debt_payload = [(m_id, exact_share) for m_id, _ in members]
     update_member_debts(group_id, expense_id, payer_member_id, debt_payload)
-    await notify_split_participants(context, group_id, payer_member_id, amount, category, description, "Equal", debt_payload)
+    await notify_split_participants(context, group_id, payer_member_id, amount, category, description, "Equal", debt_payload, expense_id=expense_id)
 
     display_shares = equal_split_display_shares(amount, member_count)
     summary = "\n".join(f"• {name}: ₹{format_rupees(disp)}" for (_, name), disp in zip(members, display_shares))

@@ -1,7 +1,15 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
 
-from database import execute, now_ist, get_user_subgroup_member_ids
+from database import (
+    execute,
+    now_ist,
+    get_user_subgroup_member_ids,
+    EXPENSE_DECLINE_WINDOW_HOURS,
+    expense_decline_deadline_passed,
+    record_expense_notification,
+    get_expense_notifications,
+)
 from keyboards.menus import (
     category_inline_menu,
     description_inline_menu,
@@ -130,6 +138,7 @@ async def notify_split_participants(
     description: str,
     split_label: str,
     member_shares: list,
+    expense_id: int = None,
 ):
     """
     Privately DMs every participant (other than the payer) a summary of the
@@ -142,6 +151,11 @@ async def notify_split_participants(
     Silently skips anyone the bot can't DM (they haven't started a private
     chat with the bot yet); this mirrors how request_settlement.py already
     handles that same failure mode.
+
+    expense_id: when provided, each DM gets a "Decline" button (see
+    share_decline_callback) and the sent message is remembered via
+    record_expense_notification() so it can be edited later if someone
+    else on this expense declines.
     """
     if not member_shares:
         return
@@ -179,8 +193,179 @@ async def notify_split_participants(
             f"⚖️ **Split:** {split_label}\n\n"
             f"💸 **Your share: ₹{share:.2f}**"
         )
+
+        reply_markup = None
+        if expense_id is not None:
+            text += (
+                f"\n\nIf this doesn't look right, you can decline within "
+                f"{EXPENSE_DECLINE_WINDOW_HOURS} hours."
+            )
+            reply_markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Decline", callback_data=f"share_decline:{expense_id}")]]
+            )
+
         try:
-            await context.bot.send_message(chat_id=telegram_user_id, text=text, parse_mode="Markdown")
+            sent = await context.bot.send_message(
+                chat_id=telegram_user_id, text=text, parse_mode="Markdown", reply_markup=reply_markup
+            )
+            if expense_id is not None:
+                record_expense_notification(expense_id, member_id, telegram_user_id, sent.message_id)
+        except Exception:
+            pass
+
+
+def reverse_expense_debts(group_id: int, expense_id: int, payer_member_id: int):
+    """Undoes the member_debts impact of an expense (used both when an
+    expense is deleted outright and when a participant declines their
+    share within the decline window)."""
+    shares_to_revert = execute(
+        "SELECT member_id, share_amount FROM expense_shares WHERE expense_id=?",
+        (expense_id,),
+        fetch=True,
+    )
+    if shares_to_revert:
+        reversed_shares = [(m_id, -amt) for m_id, amt in shares_to_revert]
+        update_member_debts(group_id, expense_id, payer_member_id, reversed_shares)
+
+
+async def share_decline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles a participant tapping "❌ Decline" on their private "your share"
+    DM. Only a Decline is offered -- there's nothing to "confirm", an
+    expense is simply live unless someone objects within the decline
+    window.
+
+    On a valid decline: the expense is marked 'declined' (kept for history,
+    excluded from balances/history/summaries), its debt impact is reversed,
+    the payer is DMed asking them to modify/re-add the expense, and every
+    other participant's copy of the "your share" DM is edited so stale
+    Decline buttons can't be pressed twice.
+    """
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    expense_id = int(query.data.split(":")[1])
+
+    expense_row = execute(
+        "SELECT group_id, payer_member_id, amount, category, description, status, created_at FROM expenses WHERE expense_id=?",
+        (expense_id,),
+        fetch=True,
+    )
+    if not expense_row:
+        await query.answer("This expense no longer exists.", show_alert=True)
+        try:
+            await query.edit_message_text("This expense no longer exists.")
+        except Exception:
+            pass
+        return
+
+    group_id, payer_member_id, amount, category, description, status, created_at = expense_row[0]
+
+    if status == "declined":
+        await query.answer("This expense has already been declined.", show_alert=True)
+        try:
+            await query.edit_message_text("ℹ️ This expense has already been declined -- no action needed.")
+        except Exception:
+            pass
+        return
+
+    # Confirm the tapper is actually one of this expense's participants
+    # (not the payer, and not an unrelated group member).
+    member_row = execute(
+        "SELECT member_id, display_name FROM members WHERE group_id=? AND telegram_user_id=?",
+        (group_id, user_id),
+        fetch=True,
+    )
+    if not member_row:
+        await query.answer("You're not part of this group.", show_alert=True)
+        return
+    member_id, member_name = member_row[0]
+
+    if member_id == payer_member_id:
+        await query.answer("You paid this expense, so there's nothing to decline.", show_alert=True)
+        return
+
+    share_row = execute(
+        "SELECT 1 FROM expense_shares WHERE expense_id=? AND member_id=?",
+        (expense_id, member_id),
+        fetch=True,
+    )
+    if not share_row:
+        await query.answer("You're not part of this expense's split.", show_alert=True)
+        return
+
+    if expense_decline_deadline_passed(created_at):
+        await query.answer("The 12-hour decline window for this expense has passed.", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    # Mark declined atomically (conditioned on still being 'active') before
+    # any `await` runs, so two people tapping Decline within the same
+    # instant can't both slip past the earlier status check.
+    execute("UPDATE expenses SET status='declined' WHERE expense_id=? AND status='active'", (expense_id,))
+    still_active = execute("SELECT status FROM expenses WHERE expense_id=?", (expense_id,), fetch=True)
+    if not still_active or still_active[0][0] != "declined":
+        # Someone else's decline (or an edit) won the race in between.
+        await query.answer("This expense has already been declined.", show_alert=True)
+        try:
+            await query.edit_message_text("ℹ️ This expense has already been declined -- no action needed.")
+        except Exception:
+            pass
+        return
+
+    await query.answer("You declined this expense.")
+    reverse_expense_debts(group_id, expense_id, payer_member_id)
+
+    try:
+        await query.edit_message_text(
+            "✅ **You declined this expense.**\nThe payer has been notified.",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+    # --- Notify the payer, with a shortcut to fix the split ---
+    payer_row = execute(
+        "SELECT telegram_user_id FROM members WHERE member_id=?", (payer_member_id,), fetch=True
+    )
+    if payer_row:
+        payer_telegram_id = payer_row[0][0]
+        desc_part = f"\n📝 {description}" if description and description != "-" else ""
+        payer_text = (
+            f"⚠️ **Expense Declined**\n\n"
+            f"**{member_name}** declined their share of expense #{expense_id}.\n"
+            f"📂 {category}{desc_part}\n"
+            f"💰 Total: ₹{amount:.2f}\n\n"
+            f"This expense has been cancelled and no longer counts toward anyone's balance. "
+            f"Please modify it (e.g. add it again without {member_name}, or with a corrected split)."
+        )
+        payer_keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✏️ Edit Amount/Category", callback_data=f"edit_exp:{expense_id}")]]
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=payer_telegram_id, text=payer_text, reply_markup=payer_keyboard, parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+    # --- Void out every other participant's Decline button ---
+    for other_member_id, other_telegram_id, other_message_id in get_expense_notifications(expense_id):
+        if other_member_id == member_id:
+            continue
+        try:
+            await context.bot.edit_message_text(
+                chat_id=other_telegram_id,
+                message_id=other_message_id,
+                text=(
+                    f"ℹ️ This expense was declined by **{member_name}** and has been cancelled.\n"
+                    f"No action needed from you."
+                ),
+                parse_mode="Markdown",
+            )
         except Exception:
             pass
 
@@ -433,13 +618,11 @@ async def expense_action_callback(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.clear()
 
     elif action == "exp_del":
-        shares_to_revert = execute("SELECT member_id, share_amount FROM expense_shares WHERE expense_id=?", (expense_id,), fetch=True)
         expense_info = execute("SELECT group_id, payer_member_id FROM expenses WHERE expense_id=?", (expense_id,), fetch=True)
-        
-        if expense_info and shares_to_revert:
+
+        if expense_info:
             g_id, p_id = expense_info[0]
-            reversed_shares = [(m_id, -amt) for m_id, amt in shares_to_revert]
-            update_member_debts(g_id, expense_id, p_id, reversed_shares)
+            reverse_expense_debts(g_id, expense_id, p_id)
 
         execute("DELETE FROM expense_shares WHERE expense_id=?", (expense_id,))
         execute("DELETE FROM expenses WHERE expense_id=?", (expense_id,))
@@ -688,7 +871,7 @@ async def execute_equal_split(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     debt_payload = [(row[0], exact_share) for row in members]
     update_member_debts(group_id, expense_id, payer_member_id, debt_payload)
-    await notify_split_participants(context, group_id, payer_member_id, amount, category, description, "Equal", debt_payload)
+    await notify_split_participants(context, group_id, payer_member_id, amount, category, description, "Equal", debt_payload, expense_id=expense_id)
 
     # Whole-rupee breakdown for THIS transaction only, purely for display --
     # never stored, never used for balances. See equal_split_display_shares().
@@ -1087,7 +1270,7 @@ async def exact_amount_received(update: Update, context: ContextTypes.DEFAULT_TY
     await notify_split_participants(
         context, group_id, payer_member_id, expense_total,
         context.user_data["category"], context.user_data.get("description", ""),
-        "Exact Amount", debt_payload,
+        "Exact Amount", debt_payload, expense_id=expense_id,
     )
 
     description_str = context.user_data.get("description") or "-"
@@ -1175,7 +1358,7 @@ async def ratio_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await notify_split_participants(
         context, group_id, payer_member_id, expense_total,
         context.user_data["category"], context.user_data.get("description", ""),
-        "Ratio", shares,
+        "Ratio", shares, expense_id=expense_id,
     )
 
     description_str = context.user_data.get("description") or "-"
