@@ -97,7 +97,15 @@ def create_tables():
     existing_expense_cols = {row[1] for row in cursor.fetchall()}
     if "status" not in existing_expense_cols:
         cursor.execute("ALTER TABLE expenses ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+        # Currency feature migration
+    if "currency" not in existing_expense_cols:
+        cursor.execute(
+            "ALTER TABLE expenses ADD COLUMN currency TEXT NOT NULL DEFAULT 'INR'"
+        )
 
+    if "exchange_rates_snapshot" not in existing_expense_cols:
+        cursor.execute(
+            "ALTER TABLE expenses ADD COLUMN exchange_rates_snapshot TEXT"
     # -----------------------------
     # EXPENSE SHARES
     # -----------------------------
