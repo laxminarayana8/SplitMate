@@ -9,6 +9,9 @@ from database import (
     expense_decline_deadline_passed,
     record_expense_notification,
     get_expense_notifications,
+    stamp_expense_currency,
+    get_member_currency,
+    save_share_conversion,
 )
 from keyboards.menus import (
     category_inline_menu,
@@ -26,7 +29,14 @@ from states import (
     SPLIT,
     EQUAL_AMONG_SELECT,
 )
-from utils import auto_delete, DELETE_AFTER_ACK, DELETE_AFTER_ERROR, DELETE_AFTER_CONFIRMATION
+from utils import (
+    auto_delete,
+    DELETE_AFTER_ACK,
+    DELETE_AFTER_ERROR,
+    DELETE_AFTER_CONFIRMATION,
+    format_amount,
+    get_exchange_rate,
+)
 
 
 async def safe_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
@@ -166,14 +176,19 @@ async def notify_split_participants(
     payer_row = execute("SELECT display_name FROM members WHERE member_id=?", (payer_member_id,), fetch=True)
     payer_name = payer_row[0][0] if payer_row else "Someone"
 
+    # Freeze the payer's currency onto the expense the moment it goes out
+    # to participants. Frozen once here, never recomputed from the payer's
+    # (possibly later-changed) personal setting -- see stamp_expense_currency.
+    expense_currency = stamp_expense_currency(expense_id, payer_member_id) if expense_id is not None else "INR"
+
     member_ids = [m for m, _ in member_shares]
     placeholders = ",".join("?" * len(member_ids))
     rows = execute(
-        f"SELECT member_id, telegram_user_id, display_name FROM members WHERE member_id IN ({placeholders})",
+        f"SELECT member_id, telegram_user_id, display_name, currency FROM members WHERE member_id IN ({placeholders})",
         tuple(member_ids),
         fetch=True,
     )
-    info = {r[0]: (r[1], r[2]) for r in rows} if rows else {}
+    info = {r[0]: (r[1], r[2], r[3] or "INR") for r in rows} if rows else {}
 
     desc_part = f"\n📝 {description}" if description and description != "-" else ""
 
@@ -181,17 +196,30 @@ async def notify_split_participants(
         if member_id == payer_member_id or share <= 0:
             continue
 
-        telegram_user_id, _name = info.get(member_id, (None, None))
+        telegram_user_id, _name, recipient_currency = info.get(member_id, (None, None, "INR"))
         if not telegram_user_id:
             continue
+
+        # Per user requirement: a participant whose own currency differs
+        # from the currency the expense was entered in also sees their
+        # share converted into their own currency, snapshotted at this
+        # moment so it can never drift with exchange-rate movement later.
+        # Same-currency participants see nothing extra.
+        converted_line = ""
+        if expense_id is not None and recipient_currency != expense_currency:
+            fx_rate = await get_exchange_rate(expense_currency, recipient_currency)
+            if fx_rate is not None:
+                converted_amount = round(share * fx_rate, 2)
+                save_share_conversion(expense_id, member_id, converted_amount, recipient_currency, fx_rate)
+                converted_line = f" (≈ {format_amount(converted_amount, recipient_currency)})"
 
         text = (
             f"🧾 **New Expense in {group_name}**\n\n"
             f"👤 Paid by: **{payer_name}**\n"
             f"📂 **Category:** {category}{desc_part}\n"
-            f"💰 **Total:** ₹{amount:.2f}\n"
+            f"💰 **Total:** {format_amount(amount, expense_currency)}\n"
             f"⚖️ **Split:** {split_label}\n\n"
-            f"💸 **Your share: ₹{share:.2f}**"
+            f"💸 **Your share: {format_amount(share, expense_currency)}{converted_line}**"
         )
 
         reply_markup = None
@@ -538,9 +566,12 @@ async def send_confirmation_card(update: Update, context: ContextTypes.DEFAULT_T
         ]
     ])
 
+    currency_row = execute("SELECT currency FROM expenses WHERE expense_id=?", (expense_id,), fetch=True)
+    expense_currency = currency_row[0][0] if currency_row and currency_row[0][0] else "INR"
+
     text = (
         f"✅ **Expense Saved**\n\n"
-        f"💰 **Amount:** ₹{amount:.2f}\n"
+        f"💰 **Amount:** {format_amount(amount, expense_currency)}\n"
         f"📂 **Category:** {category}\n"
         f"📝 **Description:** {description}\n"
         f"⚖️ **Split:** {split_type_str}\n"
@@ -876,8 +907,9 @@ async def execute_equal_split(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Whole-rupee breakdown for THIS transaction only, purely for display --
     # never stored, never used for balances. See equal_split_display_shares().
     display_shares = equal_split_display_shares(amount, member_count)
+    expense_currency = get_member_currency(payer_member_id)
     summary = "\n".join(
-        f"• {m[1]}: ₹{format_rupees(disp)}" for m, disp in zip(members, display_shares)
+        f"• {m[1]}: {format_amount(disp, expense_currency)}" for m, disp in zip(members, display_shares)
     )
     description_str = description if description else "-"
     await send_confirmation_card(update, context, expense_id, amount, category, description_str, "Equal", summary_text=summary)
@@ -972,6 +1004,7 @@ async def execute_personal_split(update: Update, context: ContextTypes.DEFAULT_T
         (group_id, payer_member_id, amount, category, description, "👤 Personal", now_ist()),
         return_lastrowid=True,
     )
+    stamp_expense_currency(expense_id, payer_member_id)
 
     execute(
         "INSERT INTO expense_shares (expense_id, member_id, share_amount) VALUES (?, ?, ?)",
@@ -1274,7 +1307,8 @@ async def exact_amount_received(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
     description_str = context.user_data.get("description") or "-"
-    summary = "\n".join(f"• {m[1]}: ₹{amt:.2f}" for m, amt in zip(members, amounts))
+    expense_currency = get_member_currency(payer_member_id)
+    summary = "\n".join(f"• {m[1]}: {format_amount(amt, expense_currency)}" for m, amt in zip(members, amounts))
 
     await send_confirmation_card(update, context, expense_id, expense_total, context.user_data["category"], description_str, "Exact Amount", summary_text=summary)
     return ConversationHandler.END
@@ -1362,8 +1396,9 @@ async def ratio_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     description_str = context.user_data.get("description") or "-"
+    expense_currency = get_member_currency(payer_member_id)
     summary = "\n".join(
-        f"• {member[1]}: ₹{share:.2f}"
+        f"• {member[1]}: {format_amount(share, expense_currency)}"
         for member, (_, share) in zip(members, shares)
     )
 

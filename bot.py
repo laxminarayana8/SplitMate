@@ -26,6 +26,7 @@ from handlers.start import start
 from handlers.join import (
     bot_added_to_chat,
     new_chat_members_handler,
+    chat_member_left_handler,
     confirm_join_callback,
 )
 from handlers.expense import (
@@ -67,6 +68,7 @@ from handlers.settings import (
     subgroup_toggle_callback,
     subgroup_save_callback,
     subgroup_reset_callback,
+    currency_set_callback,
 )
 from handlers.summary import (
     monthly_summary_command,
@@ -155,6 +157,7 @@ def main():
     # -------------------------
     app.add_handler(ChatMemberHandler(bot_added_to_chat, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_chat_members_handler))
+    app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, chat_member_left_handler))
     app.add_handler(CallbackQueryHandler(confirm_join_callback, pattern="^confirm_join:"))
 
     app.add_handler(CommandHandler("summary", monthly_summary_command))
@@ -388,6 +391,7 @@ def main():
     )
 
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^settings:"))
+    app.add_handler(CallbackQueryHandler(currency_set_callback, pattern="^currency_set:"))
     app.add_handler(CallbackQueryHandler(subgroup_toggle_callback, pattern="^subgroup_toggle:"))
     app.add_handler(CallbackQueryHandler(subgroup_save_callback, pattern="^subgroup_save$"))
     app.add_handler(CallbackQueryHandler(subgroup_reset_callback, pattern="^subgroup_reset$"))

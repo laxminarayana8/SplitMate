@@ -5,9 +5,11 @@ from database import (
     get_user_subgroup_member_ids,
     save_user_subgroup,
     reset_user_subgroup,
+    get_member_currency,
+    set_member_currency,
 )
-from keyboards.menus import settings_inline_menu, get_member_selection_menu, main_menu
-from utils import auto_delete, DELETE_AFTER_ACK, DELETE_AFTER_NOTICE
+from keyboards.menus import settings_inline_menu, get_member_selection_menu, get_currency_menu, main_menu
+from utils import auto_delete, DELETE_AFTER_ACK, DELETE_AFTER_NOTICE, SUPPORTED_CURRENCIES
 
 SUBGROUP_HEADER = (
     "👥 **Your Subgroup**\n\n"
@@ -57,6 +59,49 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await context.bot.send_message(chat_id=chat_id, text="🏠 **Main Menu:**", reply_markup=main_menu, parse_mode="Markdown")
         auto_delete(context, chat_id, msg.message_id, delay=DELETE_AFTER_ACK)
         context.user_data.pop("settings_msg_id", None)
+        return
+
+    elif data == "settings:back":
+        await query.edit_message_text(
+            text="⚙️ **SplitMate Settings**\n\nConfigure your personal default group for expense splits:",
+            reply_markup=settings_inline_menu,
+            parse_mode="Markdown",
+        )
+        return
+
+    elif data == "settings:currency":
+        acting_user_id = query.from_user.id
+
+        group = execute("SELECT group_id FROM groups WHERE telegram_chat_id=?", (chat_id,), fetch=True)
+        if not group:
+            await query.edit_message_text("❌ Group not found.")
+            return
+        group_id = group[0][0]
+
+        member = execute(
+            "SELECT member_id FROM members WHERE group_id=? AND telegram_user_id=?",
+            (group_id, acting_user_id),
+            fetch=True,
+        )
+        if not member:
+            await query.edit_message_text("❌ You're not registered in this group yet -- send /start first.")
+            return
+
+        current_currency = get_member_currency(member[0][0])
+        context.user_data["group_id"] = group_id
+
+        await query.edit_message_text(
+            text=(
+                "💱 **Your Currency**\n\n"
+                "This is the currency your own expenses are entered in. "
+                "Everyone else keeps splitting normally -- anyone whose currency "
+                "differs from yours just also sees their share converted into "
+                "theirs, frozen at the moment you add the expense.\n\n"
+                f"Current: **{SUPPORTED_CURRENCIES.get(current_currency, '')} {current_currency}**"
+            ),
+            reply_markup=get_currency_menu(current_currency),
+            parse_mode="Markdown",
+        )
         return
 
     elif data == "settings:select_users":
@@ -172,3 +217,38 @@ async def subgroup_save_callback(update: Update, context: ContextTypes.DEFAULT_T
     msg = await context.bot.send_message(chat_id=chat_id, text="🏠 **Main Menu:**", reply_markup=main_menu, parse_mode="Markdown")
     auto_delete(context, chat_id, msg.message_id, delay=DELETE_AFTER_NOTICE)
     context.user_data.clear()
+
+
+async def currency_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets the acting user's personal currency (for this group) from the
+    Currency picker. New expenses they pay for from now on are recorded in
+    this currency; past expenses/history are untouched (see
+    stamp_expense_currency, which freezes the currency at creation time)."""
+    query = update.callback_query
+    acting_user_id = query.from_user.id
+    chat_id = update.effective_chat.id
+
+    currency = query.data.split(":", 1)[1]
+    if currency not in SUPPORTED_CURRENCIES:
+        await query.answer("❌ Unsupported currency.", show_alert=True)
+        return
+
+    group_id = context.user_data.get("group_id")
+    if not group_id:
+        group = execute("SELECT group_id FROM groups WHERE telegram_chat_id=?", (chat_id,), fetch=True)
+        if not group:
+            await query.answer("❌ Group not found.", show_alert=True)
+            return
+        group_id = group[0][0]
+
+    set_member_currency(group_id, acting_user_id, currency)
+    await query.answer(f"✅ Currency set to {currency}")
+
+    await query.edit_message_text(
+        text=(
+            "💱 **Your Currency**\n\n"
+            f"Updated -- your expenses are now entered in **{SUPPORTED_CURRENCIES[currency]} {currency}**."
+        ),
+        reply_markup=get_currency_menu(currency),
+        parse_mode="Markdown",
+    )

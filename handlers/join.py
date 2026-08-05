@@ -1,7 +1,9 @@
+import asyncio
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from database import execute, now_ist, get_or_create_group_id
+from database import execute, now_ist, get_or_create_group_id, deactivate_member
 from utils import auto_delete, DELETE_AFTER_NOTICE
 
 
@@ -35,7 +37,27 @@ async def bot_added_to_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #    each, ever, per group) and post an invite card with a Join Group button.
 # -----------------------------
 async def new_chat_members_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("========== NEW MEMBER HANDLER ==========")
+    """
+    Previously this whole function ran with no error handling. Telegram can
+    deliver a big "add 6 people" action as several separate service
+    messages in quick succession, and any unhandled exception here (a
+    flaky get_or_create_group_id race -- now fixed separately -- a
+    transient Telegram API error on send_message, etc.) was silently
+    swallowed by PTB's default error handler: the welcome message for that
+    particular batch just never went out, with nothing in the chat to show
+    it failed. That matches "sometimes it's working and sometimes not."
+    Wrapping the body and adding one retry around the final send_message
+    (for transient/rate-limit errors) makes a single bad update fail loud
+    (logged) instead of silently, and recover on its own where possible.
+    """
+    try:
+        await _handle_new_chat_members(update, context)
+    except Exception:
+        import logging
+        logging.exception("new_chat_members_handler failed for chat %s", update.effective_chat.id if update.effective_chat else "?")
+
+
+async def _handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     chat = update.effective_chat
 
@@ -56,7 +78,14 @@ async def new_chat_members_handler(update: Update, context: ContextTypes.DEFAULT
         )
         if existing:
             # Already known for this group (pending OR confirmed) -- never
-            # re-register or re-prompt them for the same group.
+            # re-register or re-prompt them for the same group. Also
+            # covers someone who was previously removed (is_active=0) and
+            # has now been re-added: welcome them back as active again
+            # rather than leaving them stuck inactive.
+            execute(
+                "UPDATE members SET is_active=1 WHERE member_id=?",
+                (existing[0][0],),
+            )
             continue
 
         execute(
@@ -83,7 +112,45 @@ async def new_chat_members_handler(update: Update, context: ContextTypes.DEFAULT
     )
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Join Group", url=join_url)]])
 
-    await context.bot.send_message(chat_id=chat.id, text=text, reply_markup=keyboard)
+    for attempt in range(2):
+        try:
+            await context.bot.send_message(chat_id=chat.id, text=text, reply_markup=keyboard)
+            break
+        except Exception:
+            if attempt == 1:
+                raise
+            await asyncio.sleep(1.5)
+
+
+# -----------------------------
+# 2b. A human left OR was removed from the group -- mark them inactive.
+# -----------------------------
+# There was previously no handler for this at all. A member who got
+# removed (especially one who was still 'pending' -- added by mistake and
+# removed before they ever confirmed) stayed is_active=1 forever, so every
+# "active members" query -- including the equal-split participant list --
+# kept including them. Equal split would then hold the expense open
+# forever "waiting" on a Join Group confirmation from someone who isn't
+# even in the chat anymore. This listens for Telegram's own "member
+# left/removed" service message and flips them inactive so future splits
+# stop counting them.
+async def chat_member_left_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    chat = update.effective_chat
+
+    if not message or not message.left_chat_member:
+        return
+
+    user = message.left_chat_member
+    if user.is_bot:
+        return
+
+    group = execute("SELECT group_id FROM groups WHERE telegram_chat_id=?", (chat.id,), fetch=True)
+    if not group:
+        return
+    group_id = group[0][0]
+
+    deactivate_member(group_id, user.id)
 
 
 # -----------------------------

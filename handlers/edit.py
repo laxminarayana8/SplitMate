@@ -79,11 +79,36 @@ async def save_edited_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     expense_id = context.user_data.get("edit_expense_id")
     new_value_text = update.message.text
 
+    expense_row = execute(
+        "SELECT group_id, payer_member_id, category, description, split_type, status FROM expenses WHERE expense_id=?",
+        (expense_id,),
+        fetch=True,
+    )
+    if not expense_row:
+        await update.message.reply_text("❌ Expense not found or already deleted.", reply_markup=main_menu)
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    group_id, payer_member_id, category, description, split_type, status = expense_row[0]
+    # Editing a *declined* expense is how the payer is meant to fix and
+    # resubmit it (see the "✏️ Edit Amount/Category" button on the decline
+    # notice in handlers/expense.py::share_decline_callback). Previously
+    # this function only ever updated the expenses/expense_shares rows --
+    # it never flipped status back to 'active', never restored the
+    # member_debts it had reversed on decline, and never re-sent the "your
+    # share" DMs. Since history/balance/summary queries all filter out
+    # status='declined', the edited expense just silently stayed invisible
+    # forever with no error shown. was_declined below drives all three of
+    # those follow-up steps.
+    was_declined = status == "declined"
+
     if field == "amount":
         try:
             new_amount = float(new_value_text)
+            if new_amount <= 0:
+                raise ValueError
         except ValueError:
-            await update.message.reply_text("❌ Enter a valid numeric amount.")
+            await update.message.reply_text("❌ Enter a valid numeric amount greater than 0.")
             return EDIT_NEW_VALUE
 
         # Update expense table
@@ -93,12 +118,7 @@ async def save_edited_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         # Recalculate equal shares if split_type was Equal
-        split = execute(
-            "SELECT split_type FROM expenses WHERE expense_id=?",
-            (expense_id,),
-            fetch=True,
-        )
-        if split and split[0][0] == "⚖️ Equal":
+        if split_type == "⚖️ Equal":
             shares = execute(
                 "SELECT member_id FROM expense_shares WHERE expense_id=?",
                 (expense_id,),
@@ -114,8 +134,15 @@ async def save_edited_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     (per_head, expense_id),
                 )
 
+        reactivated = False
+        if was_declined:
+            reactivated = await _reactivate_declined_expense(
+                context, expense_id, group_id, payer_member_id, new_amount, category, description, split_type
+            )
+
+        note = "\n\n🔄 This expense is active again -- everyone's been re-notified." if reactivated else ""
         await update.message.reply_text(
-            f"✅ **Expense #{expense_id} Updated!**\nNew Amount: ₹{format_rupees(new_amount)}",
+            f"✅ **Expense #{expense_id} Updated!**\nNew Amount: ₹{format_rupees(new_amount)}{note}",
             reply_markup=main_menu,
         )
 
@@ -124,13 +151,68 @@ async def save_edited_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "UPDATE expenses SET category=? WHERE expense_id=?",
             (new_value_text, expense_id),
         )
+
+        reactivated = False
+        if was_declined:
+            amount_row = execute("SELECT amount FROM expenses WHERE expense_id=?", (expense_id,), fetch=True)
+            current_amount = amount_row[0][0] if amount_row else 0
+            reactivated = await _reactivate_declined_expense(
+                context, expense_id, group_id, payer_member_id, current_amount, new_value_text, description, split_type
+            )
+
+        note = "\n\n🔄 This expense is active again -- everyone's been re-notified." if reactivated else ""
         await update.message.reply_text(
-            f"✅ **Expense #{expense_id} Updated!**\nNew Category: {new_value_text}",
+            f"✅ **Expense #{expense_id} Updated!**\nNew Category: {new_value_text}{note}",
             reply_markup=main_menu,
         )
 
     context.user_data.clear()
     return ConversationHandler.END
+
+
+async def _reactivate_declined_expense(
+    context: ContextTypes.DEFAULT_TYPE,
+    expense_id: int,
+    group_id: int,
+    payer_member_id: int,
+    amount: float,
+    category: str,
+    description: str,
+    split_type: str,
+) -> bool:
+    """
+    Brings a previously-declined expense back to life after the payer edits
+    it: flips status back to 'active' (so history/balance/summary pick it
+    up again -- they all filter out 'declined'), re-applies its debt impact
+    (declining had reversed it), and re-sends each participant their "your
+    share" DM with a fresh Decline option. Returns False (no-op) if there's
+    nothing to notify.
+    """
+    # Imported locally to avoid a circular import (handlers.expense already
+    # imports nothing from handlers.edit, so this is one-directional, but
+    # keeping it local mirrors how handlers/join.py does the same thing).
+    from handlers.expense import update_member_debts, notify_split_participants
+
+    shares = execute(
+        "SELECT member_id, share_amount FROM expense_shares WHERE expense_id=?",
+        (expense_id,),
+        fetch=True,
+    )
+    if not shares:
+        # Nothing to restore debts/notifications for -- still reactivate so
+        # it's not stuck hidden.
+        execute("UPDATE expenses SET status='active' WHERE expense_id=?", (expense_id,))
+        return False
+
+    execute("UPDATE expenses SET status='active' WHERE expense_id=?", (expense_id,))
+
+    debt_payload = [(member_id, share_amount) for member_id, share_amount in shares]
+    update_member_debts(group_id, expense_id, payer_member_id, debt_payload)
+    await notify_split_participants(
+        context, group_id, payer_member_id, amount, category, description,
+        split_type, debt_payload, expense_id=expense_id,
+    )
+    return True
 
 
 async def cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):

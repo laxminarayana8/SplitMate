@@ -1,4 +1,6 @@
 import asyncio
+import time
+import httpx
 from telegram.ext import ContextTypes
 
 # -----------------------------
@@ -80,3 +82,76 @@ def require_subscription(handler):
 
     wrapped.__name__ = getattr(handler, "__name__", "wrapped")
     return wrapped
+
+
+# -----------------------------
+# CURRENCY
+# -----------------------------
+# Add an entry here to make a currency selectable in Settings -> Currency.
+SUPPORTED_CURRENCIES = {
+    "INR": "₹",
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£",
+    "HKD": "HK$",
+    "SGD": "S$",
+    "AED": "AED",
+    "AUD": "A$",
+}
+
+# Exchange-rate lookups are cached for a short window purely to avoid
+# hammering the API when several participants share the same currency pair
+# on one expense -- this is NOT the "frozen at expense time" snapshot
+# (that's stored per-share in the DB by save_share_conversion). Even a
+# stale-by-a-few-minutes rate here only affects what gets written into that
+# permanent snapshot at creation time; it never changes afterwards.
+_FX_CACHE_TTL_SECONDS = 300
+_fx_cache = {}
+
+
+def format_amount(amount, currency: str) -> str:
+    """Formats an amount with its currency symbol -- 0dp when it's a whole
+    number, 2dp otherwise (mirrors format_rupees, generalized to any
+    supported currency)."""
+    symbol = SUPPORTED_CURRENCIES.get(currency, currency + " ")
+    try:
+        rounded = round(float(amount), 2)
+    except (TypeError, ValueError):
+        return f"{symbol}0"
+    if rounded == int(rounded):
+        return f"{symbol}{int(rounded):,}"
+    return f"{symbol}{rounded:,.2f}"
+
+
+async def get_exchange_rate(base_currency: str, target_currency: str):
+    """
+    Returns how many units of target_currency equal 1 unit of
+    base_currency, or None if the rate couldn't be fetched (caller should
+    skip showing a conversion rather than guess).
+
+    Uses a free, no-key exchange-rate API. Callers are responsible for
+    persisting whatever rate they get back (see save_share_conversion) --
+    this function itself has no memory of "the rate an expense used", only
+    a short cache to cut down on repeat calls within the same burst of
+    notifications.
+    """
+    if base_currency == target_currency:
+        return 1.0
+
+    cache_key = (base_currency, target_currency)
+    cached = _fx_cache.get(cache_key)
+    if cached and (time.monotonic() - cached[1]) < _FX_CACHE_TTL_SECONDS:
+        return cached[0]
+
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            resp = await client.get(f"https://api.exchangerate-api.com/v4/latest/{base_currency}")
+            resp.raise_for_status()
+            data = resp.json()
+            rate = data.get("rates", {}).get(target_currency)
+    except Exception:
+        rate = None
+
+    if rate is not None:
+        _fx_cache[cache_key] = (rate, time.monotonic())
+    return rate

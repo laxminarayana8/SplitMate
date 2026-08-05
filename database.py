@@ -5,6 +5,9 @@ from config import DATABASE_NAME
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
+# Every new member/expense starts on this currency until changed in Settings.
+DEFAULT_CURRENCY = "INR"
+
 
 def now_ist() -> str:
     """Returns the current time in IST as 'YYYY-MM-DD HH:MM:SS'.
@@ -184,6 +187,32 @@ def create_tables():
     existing_member_cols = {row[1] for row in cursor.fetchall()}
     if "status" not in existing_member_cols:
         cursor.execute("ALTER TABLE members ADD COLUMN status TEXT NOT NULL DEFAULT 'confirmed'")
+
+    # Migration: per-member display currency. Everyone starts on INR until
+    # they change it in Settings -> Currency (see handlers/settings.py).
+    if "currency" not in existing_member_cols:
+        cursor.execute(f"ALTER TABLE members ADD COLUMN currency TEXT NOT NULL DEFAULT '{DEFAULT_CURRENCY}'")
+
+    # Migration: the currency an expense was actually entered in (the
+    # payer's currency at the moment they added it). Snapshotted once at
+    # creation -- see stamp_expense_currency() -- so it never drifts even
+    # if the payer changes their personal currency later.
+    cursor.execute("PRAGMA table_info(expenses)")
+    existing_expense_cols = {row[1] for row in cursor.fetchall()}
+    if "currency" not in existing_expense_cols:
+        cursor.execute(f"ALTER TABLE expenses ADD COLUMN currency TEXT NOT NULL DEFAULT '{DEFAULT_CURRENCY}'")
+
+    # Migration: a per-share converted-amount snapshot, so a participant
+    # whose display currency differs from the expense's currency sees a
+    # fixed conversion frozen at expense time -- see save_share_conversion().
+    cursor.execute("PRAGMA table_info(expense_shares)")
+    existing_share_cols = {row[1] for row in cursor.fetchall()}
+    if "converted_amount" not in existing_share_cols:
+        cursor.execute("ALTER TABLE expense_shares ADD COLUMN converted_amount REAL")
+    if "converted_currency" not in existing_share_cols:
+        cursor.execute("ALTER TABLE expense_shares ADD COLUMN converted_currency TEXT")
+    if "fx_rate" not in existing_share_cols:
+        cursor.execute("ALTER TABLE expense_shares ADD COLUMN fx_rate REAL")
 
     # -----------------------------
     # PENDING EXPENSES
@@ -393,10 +422,22 @@ def get_or_create_group_id(chat_id: int, chat_title: str = None) -> int:
     if group:
         return group[0][0]
 
-    execute(
-        "INSERT INTO groups (telegram_chat_id, group_name) VALUES (?, ?)",
-        (chat_id, chat_title or "Group"),
-    )
+    # Two Telegram updates for the same brand-new chat (e.g. the bot's own
+    # my_chat_member update and the first new_chat_members update) can land
+    # on the event loop close enough together that both see "no row yet"
+    # from the SELECT above and both try to INSERT. telegram_chat_id is
+    # UNIQUE, so the loser used to blow up with an unhandled
+    # IntegrityError -- which, for new_chat_members_handler, meant the
+    # welcome message never got sent at all. Treat that race as a cache
+    # miss and just re-select instead of crashing.
+    try:
+        execute(
+            "INSERT INTO groups (telegram_chat_id, group_name) VALUES (?, ?)",
+            (chat_id, chat_title or "Group"),
+        )
+    except sqlite3.IntegrityError:
+        pass
+
     return execute(
         "SELECT group_id FROM groups WHERE telegram_chat_id = ?",
         (chat_id,),
@@ -524,6 +565,80 @@ def get_expense_notifications(expense_id: int):
         (expense_id,),
         fetch=True,
     ) or []
+
+
+# -----------------------------
+# MEMBER REMOVAL (member left/was removed from the Telegram group)
+# -----------------------------
+def deactivate_member(group_id: int, telegram_user_id: int):
+    """
+    Marks a member inactive when Telegram tells us they've left or been
+    removed from the group chat. Without this, a member who was removed
+    (especially one who never confirmed via the join flow, i.e. still
+    'pending') stays is_active=1 forever, so every "active members" query
+    -- including the equal-split participant list -- keeps including them
+    and equal splits get stuck waiting for someone who isn't in the group
+    anymore to confirm/join.
+
+    We deliberately keep their row (history/expense_shares reference it)
+    and just flip is_active=0, mirroring how the rest of the schema treats
+    membership.
+    """
+    execute(
+        "UPDATE members SET is_active=0 WHERE group_id=? AND telegram_user_id=?",
+        (group_id, telegram_user_id),
+    )
+
+
+# -----------------------------
+# CURRENCY
+# -----------------------------
+def get_member_currency(member_id: int) -> str:
+    """Returns a member's personal display/entry currency (defaults to
+    DEFAULT_CURRENCY for anyone who hasn't changed it)."""
+    row = execute(
+        "SELECT currency FROM members WHERE member_id=?",
+        (member_id,),
+        fetch=True,
+    )
+    return (row[0][0] if row and row[0][0] else DEFAULT_CURRENCY)
+
+
+def set_member_currency(group_id: int, telegram_user_id: int, currency: str):
+    """Updates the acting user's personal currency for this group. New
+    expenses they pay for will be recorded in this currency going forward;
+    past expenses are untouched."""
+    execute(
+        "UPDATE members SET currency=? WHERE group_id=? AND telegram_user_id=?",
+        (currency, group_id, telegram_user_id),
+    )
+
+
+def stamp_expense_currency(expense_id: int, payer_member_id: int) -> str:
+    """
+    Freezes the payer's *current* currency onto the expense row at the
+    moment it's created, and returns it. Expenses always display/report in
+    whatever currency they were entered in, even if the payer later changes
+    their personal currency setting -- history must never retroactively
+    change.
+    """
+    currency = get_member_currency(payer_member_id)
+    execute("UPDATE expenses SET currency=? WHERE expense_id=?", (currency, expense_id))
+    return currency
+
+
+def save_share_conversion(expense_id: int, member_id: int, converted_amount, converted_currency, fx_rate):
+    """
+    Freezes a single participant's share, converted into their own display
+    currency, at expense-creation time. Storing the snapshot (rather than
+    recomputing on every read) is what guarantees the shown amount never
+    moves later just because exchange rates did.
+    """
+    execute(
+        "UPDATE expense_shares SET converted_amount=?, converted_currency=?, fx_rate=? "
+        "WHERE expense_id=? AND member_id=?",
+        (converted_amount, converted_currency, fx_rate, expense_id, member_id),
+    )
 
 
 def _month_total_expenditure(group_id: int, year: int, month: int) -> float:

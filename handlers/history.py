@@ -4,6 +4,7 @@ from telegram.ext import ContextTypes
 from database import execute
 from keyboards.menus import main_menu, history_filter_inline_menu
 from utils import auto_delete, format_rupees, DELETE_AFTER_NOTICE
+from services.currency import convert_amount
 
 
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -104,12 +105,22 @@ async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     current_member_id, user_display_name = member[0]
 
-    # Base query for expenses excluding settlements (e.g., category != 'Settlement')
+    # Fetch user's preferred currency (defaults to INR)
+    user_curr_res = execute(
+        "SELECT default_currency FROM user_settings WHERE user_id=?",
+        (user_id,),
+        fetch=True
+    )
+    user_currency = user_curr_res[0][0] if user_curr_res else "INR"
+
+    # Base query for expenses excluding settlements, including currency & exchange rates snapshot
     base_query = """
         SELECT
             e.expense_id,
             m.display_name,
             e.amount,
+            e.currency,
+            e.exchange_rates_snapshot,
             e.category,
             e.description,
             e.split_type,
@@ -151,14 +162,18 @@ async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Update initial selection message to reflect chosen filter
-    await query.edit_message_text(f"📂 **History View — {filter_title}:**", parse_mode="Markdown")
+    await query.edit_message_text(f"📂 **History View — {filter_title} [{user_currency}]:**", parse_mode="Markdown")
 
-    total = 0
+    total = 0.0
 
-    # Send each expense as an individual structured message block to private chat
+    # Send each expense as an individual structured message block to private chat with currency conversion
     for expense in expenses:
-        expense_id, payer, amount, category, description, split_type, created_at = expense
-        total += amount
+        expense_id, payer, raw_amount, curr, snapshot, category, description, split_type, created_at = expense
+        curr = curr or "INR"
+        
+        # Convert expense amount into user's preferred currency using historical snapshot if available
+        converted_amount = convert_amount(raw_amount, curr, user_currency, snapshot)
+        total += converted_amount
 
         desc_text = f"📝 Description: {description}\n" if description else ""
 
@@ -166,7 +181,7 @@ async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🆔 **ID:** #{expense_id}\n"
             f"📂 **Category:** {category}\n"
             f"{desc_text}"
-            f"💰 **Amount:** ₹{format_rupees(amount)}\n"
+            f"💰 **Amount:** {user_currency} {format_rupees(converted_amount)}" + (f" _(Orig: {curr} {format_rupees(raw_amount)})_" if curr != user_currency else "") + f"\n"
             f"👤 **Paid by:** {payer}\n"
             f"⚖️ **Split:** {split_type}\n"
             f"📅 **Date:** {created_at}"
@@ -174,9 +189,9 @@ async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await context.bot.send_message(chat_id=chat_id, text=message_text, parse_mode="Markdown")
 
-    # Send total sum at the end of private chat output
+    # Send total sum at the end of private chat output in user's currency
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"💵 **Total ({filter_title}):** ₹{format_rupees(total)}",
+        text=f"💵 **Total ({filter_title}):** {user_currency} {format_rupees(total)}",
         parse_mode="Markdown"
     )

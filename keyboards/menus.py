@@ -1,5 +1,6 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from config import CATEGORIES, SPLIT_TYPES
+from utils import SUPPORTED_CURRENCIES
 
 
 def chunk_list_inline(items, callback_prefix, chunk_size=3):
@@ -85,8 +86,26 @@ history_filter_inline_menu = InlineKeyboardMarkup([
 # -------------------------
 settings_inline_menu = InlineKeyboardMarkup([
     [InlineKeyboardButton("👥 Select Users (Subgroup)", callback_data="settings:select_users")],
+    [InlineKeyboardButton("💱 Currency", callback_data="settings:currency")],
     [InlineKeyboardButton("❌ Close", callback_data="settings:close")]
 ])
+
+
+def get_currency_menu(current_currency: str):
+    """Inline grid of supported currencies, marking the acting user's
+    current pick. Tapping one sets it via currency_set_callback."""
+    buttons = []
+    row = []
+    for code, symbol in SUPPORTED_CURRENCIES.items():
+        icon = "✅ " if code == current_currency else ""
+        row.append(InlineKeyboardButton(f"{icon}{symbol} {code}", callback_data=f"currency_set:{code}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="settings:back")])
+    return InlineKeyboardMarkup(buttons)
 
 
 def get_member_selection_menu(members, selected_ids):
