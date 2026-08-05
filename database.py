@@ -106,6 +106,7 @@ def create_tables():
     if "exchange_rates_snapshot" not in existing_expense_cols:
         cursor.execute(
             "ALTER TABLE expenses ADD COLUMN exchange_rates_snapshot TEXT"
+        )
     # -----------------------------
     # EXPENSE SHARES
     # -----------------------------
