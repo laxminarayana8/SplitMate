@@ -4,6 +4,8 @@ import json
 import logging
 
 from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import PlainTextResponse
+import os
 
 from config import RAZORPAY_WEBHOOK_SECRET
 from database import grant_subscription, execute
@@ -37,6 +39,27 @@ def create_webhook_app(telegram_application) -> FastAPI:
     Telegram message the instant a payment clears.
     """
     app = FastAPI()
+
+    VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "splitmate123")
+
+
+    @app.get("/webhook")
+    async def verify_webhook(request: Request):
+        mode = request.query_params.get("hub.mode")
+        token = request.query_params.get("hub.verify_token")
+        challenge = request.query_params.get("hub.challenge")
+
+        if mode == "subscribe" and token == VERIFY_TOKEN:
+            return PlainTextResponse(challenge)
+
+        raise HTTPException(status_code=403, detail="Verification failed")
+
+
+    @app.post("/webhook")
+    async def whatsapp_webhook(request: Request):
+        body = await request.json()
+        print("WhatsApp Webhook:", body)
+        return {"status": "ok"}
 
     @app.post("/razorpay/webhook")
     async def razorpay_webhook(
